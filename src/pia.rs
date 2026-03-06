@@ -108,12 +108,16 @@ pub struct PrivateInternetAccess {
 }
 
 // Verifies PIA server certificates against PIA's own CA cert, but does NOT
-// check the hostname. Required because PIA now uses short internal hostnames
-// (e.g. "server-12521-0a") in their server list that carry no public DNS record.
-// We connect by IP and establish trust solely through the CA, which is the same
-// approach used by PIA's own official shell scripts via `curl --cacert`.
+// enforce hostname matching. Required because PIA now uses short internal
+// hostnames (e.g. "server-12521-0a") in their server list that carry no
+// public DNS record and whose certificates may not carry a matching SAN.
+// We connect by IP and establish trust via the CA cert — the same approach
+// PIA's own shell scripts use with `curl --connect-to ... --cacert`.
+//
+// All other certificate errors (bad chain, unknown issuer, expiry, etc.)
+// are still propagated normally.
 struct PiaCertVerifier {
-    roots: Vec<rustls::OwnedTrustAnchor>,
+    inner: rustls::client::WebPkiVerifier,
 }
 
 impl rustls::client::ServerCertVerifier for PiaCertVerifier {
@@ -121,39 +125,23 @@ impl rustls::client::ServerCertVerifier for PiaCertVerifier {
         &self,
         end_entity: &rustls::Certificate,
         intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
+        server_name: &rustls::ServerName,
+        scts: &mut dyn Iterator<Item = &[u8]>,
+        ocsp_response: &[u8],
         now: SystemTime,
     ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
-        let trust_anchors: Vec<webpki::TrustAnchor<'_>> = self
-            .roots
-            .iter()
-            .map(|a| webpki::TrustAnchor {
-                subject: a.subject(),
-                spki: a.subject_public_key_info(),
-                name_constraints: a.name_constraints(),
-            })
-            .collect();
-
-        let cert = webpki::EndEntityCert::try_from(end_entity.0.as_ref())
-            .map_err(|e| rustls::Error::General(format!("PIA cert parse error: {:?}", e)))?;
-
-        let chain: Vec<&[u8]> = intermediates.iter().map(|c| c.0.as_ref()).collect();
-
-        let now_time = webpki::Time::try_from(now)
-            .map_err(|_| rustls::Error::FailedToGetCurrentTime)?;
-
-        cert.verify_is_valid_tls_server_cert(
-            webpki::ALL_VERIFICATION_ALGS,
-            &webpki::TlsServerTrustAnchors(&trust_anchors),
-            &chain,
-            now_time,
-        )
-        .map_err(|e| rustls::Error::General(format!("PIA cert chain error: {:?}", e)))?;
-
-        // Hostname check intentionally omitted — see struct-level comment.
-        Ok(rustls::client::ServerCertVerified::assertion())
+        match self
+            .inner
+            .verify_server_cert(end_entity, intermediates, server_name, scts, ocsp_response, now)
+        {
+            Ok(v) => Ok(v),
+            // CA chain check already passed; the only thing that failed is the
+            // SAN/hostname match against PIA's short internal server name.
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName,
+            )) => Ok(rustls::client::ServerCertVerified::assertion()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -232,13 +220,8 @@ impl PrivateInternetAccess {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.add_parsable_certificates(&[include_bytes!("../ca.rsa.4096.der")]);
 
-        // Custom verifier: validates the cert chain against PIA's bundled CA cert
-        // but skips hostname verification. PIA now returns short internal server
-        // names (e.g. "server-12521-0a") that public DNS cannot resolve, so we
-        // connect directly to the known IP. Trust is established via the CA cert,
-        // exactly as the official PIA scripts do with `curl --connect-to ... --cacert`.
         let verifier = PiaCertVerifier {
-            roots: root_store.roots,
+            inner: rustls::client::WebPkiVerifier::new(root_store, None),
         };
 
         let tls_config = rustls::ClientConfig::builder()

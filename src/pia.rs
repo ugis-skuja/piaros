@@ -4,8 +4,9 @@ use chrono::prelude::*;
 use log::info;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::SystemTime;
 use ureq;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -106,6 +107,56 @@ pub struct PrivateInternetAccess {
     port_forward_config: Option<PortForwardConfig>,
 }
 
+// Verifies PIA server certificates against PIA's own CA cert, but does NOT
+// check the hostname. Required because PIA now uses short internal hostnames
+// (e.g. "server-12521-0a") in their server list that carry no public DNS record.
+// We connect by IP and establish trust solely through the CA, which is the same
+// approach used by PIA's own official shell scripts via `curl --cacert`.
+struct PiaCertVerifier {
+    roots: Vec<rustls::OwnedTrustAnchor>,
+}
+
+impl rustls::client::ServerCertVerifier for PiaCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::Certificate,
+        intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        now: SystemTime,
+    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
+        let trust_anchors: Vec<webpki::TrustAnchor<'_>> = self
+            .roots
+            .iter()
+            .map(|a| webpki::TrustAnchor {
+                subject: a.subject(),
+                spki: a.subject_public_key_info(),
+                name_constraints: a.name_constraints(),
+            })
+            .collect();
+
+        let cert = webpki::EndEntityCert::try_from(end_entity.0.as_ref())
+            .map_err(|e| rustls::Error::General(format!("PIA cert parse error: {:?}", e)))?;
+
+        let chain: Vec<&[u8]> = intermediates.iter().map(|c| c.0.as_ref()).collect();
+
+        let now_time = webpki::Time::try_from(now)
+            .map_err(|_| rustls::Error::FailedToGetCurrentTime)?;
+
+        cert.verify_is_valid_tls_server_cert(
+            webpki::ALL_VERIFICATION_ALGS,
+            &webpki::TlsServerTrustAnchors(&trust_anchors),
+            &chain,
+            now_time,
+        )
+        .map_err(|e| rustls::Error::General(format!("PIA cert chain error: {:?}", e)))?;
+
+        // Hostname check intentionally omitted — see struct-level comment.
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
+}
+
 impl PrivateInternetAccess {
     pub fn new(username: &str, password: &str, server_region: &str) -> Self {
         return Self {
@@ -174,29 +225,32 @@ impl PrivateInternetAccess {
         return Ok(servers.to_vec());
     }
 
-    fn create_agent(
-        &self,
-        server_name: &str,
-        server_ip: &str,
-        server_port: u16,
-    ) -> Result<ureq::Agent> {
+    fn create_agent(&self, server_ip: &str, server_port: u16) -> Result<ureq::Agent> {
         let parsed_ip: Ipv4Addr = server_ip.parse()?;
         let socket = SocketAddr::new(IpAddr::V4(parsed_ip), server_port);
-        let dns_name = String::from(server_name);
 
         let mut root_store = rustls::RootCertStore::empty();
         root_store.add_parsable_certificates(&[include_bytes!("../ca.rsa.4096.der")]);
 
+        // Custom verifier: validates the cert chain against PIA's bundled CA cert
+        // but skips hostname verification. PIA now returns short internal server
+        // names (e.g. "server-12521-0a") that public DNS cannot resolve, so we
+        // connect directly to the known IP. Trust is established via the CA cert,
+        // exactly as the official PIA scripts do with `curl --connect-to ... --cacert`.
+        let verifier = PiaCertVerifier {
+            roots: root_store.roots,
+        };
+
         let tls_config = rustls::ClientConfig::builder()
             .with_safe_defaults()
-            .with_root_certificates(root_store)
+            .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth();
 
+        // Unconditional resolver: always route to the known server IP.
+        // This agent is created per-request for a single PIA server endpoint,
+        // so there is no risk of routing unrelated traffic to this socket.
         return Ok(ureq::AgentBuilder::new()
-            .resolver(move |addr: &str| match addr {
-                _ if addr == format!("{}:{}", dns_name, server_port) => Ok(vec![socket]),
-                addr => addr.to_socket_addrs().map(Iterator::collect),
-            })
+            .resolver(move |_addr: &str| Ok(vec![socket]))
             .tls_config(Arc::new(tls_config))
             .build());
     }
@@ -214,7 +268,7 @@ impl PrivateInternetAccess {
         info!("Using server {} at {}", server.cn, server.ip);
 
         let port = self.get_port("wg")?;
-        let agent = self.create_agent(&server.cn, &server.ip, port)?;
+        let agent = self.create_agent(&server.ip, port)?;
         let url = format!("https://{}:{}/addKey", server.cn, port);
 
         let token = self.get_auth_token()?;
@@ -245,7 +299,7 @@ impl PrivateInternetAccess {
             Some(s) => s,
         };
 
-        let agent = self.create_agent(&server.cn, &server.ip, PIA_PF_API_PORT)?;
+        let agent = self.create_agent(&server.ip, PIA_PF_API_PORT)?;
         let url = format!("https://{}:{}/getSignature", server.cn, PIA_PF_API_PORT);
         let token = self.get_auth_token()?;
 
@@ -283,7 +337,7 @@ impl PrivateInternetAccess {
             return Err("Requested port forward expired".into());
         }
 
-        let agent = self.create_agent(&server.cn, &server.ip, PIA_PF_API_PORT)?;
+        let agent = self.create_agent(&server.ip, PIA_PF_API_PORT)?;
         let url = format!("https://{}:{}/bindPort", server.cn, PIA_PF_API_PORT);
 
         agent

@@ -98,6 +98,39 @@ docker run -it --rm \
 ghcr.io/fruel/piaros:latest-amd64
 ```
 
+# Publishing from a GitHub fork
+
+The existing [build workflow](.github/workflows/build.yml) builds `amd64`,
+`arm64`, and 32-bit `arm/v7` images. A version tag publishes the images to your
+fork's GitHub Container Registry namespace (`ghcr.io/OWNER/REPOSITORY`), creates
+a multi-platform `latest` image, and attaches architecture-specific tar files
+to a GitHub release. It uses GitHub's built-in `GITHUB_TOKEN`, so no registry
+credentials need to be added to your fork.
+
+In the fork's **Settings > Actions > General > Workflow permissions**, select
+**Read and write permissions**. Then push a version tag:
+
+   ```bash
+   git tag v1.0.1
+   git push origin v1.0.1
+   ```
+
+The workflow derives the image name from `github.repository`; it does not
+contain an owner-specific image path. After the workflow succeeds, consumers
+can let Docker select the correct architecture automatically:
+
+```bash
+docker pull ghcr.io/YOUR_GITHUB_USERNAME/piaros:latest
+```
+
+For RouterOS, download the architecture-specific image as a tar archive on a
+computer with Docker, and then upload that file to the router:
+
+```bash
+docker pull ghcr.io/YOUR_GITHUB_USERNAME/piaros:latest-arm64
+docker save ghcr.io/YOUR_GITHUB_USERNAME/piaros:latest-arm64 --output piaros-arm64.tar
+```
+
 # Port Forwarding
 
 Private Internet Access has the option to request a forwarded port for incoming connections. A port forward is valid for ~2 months and regular keep-alive message need to be sent to keep it active.

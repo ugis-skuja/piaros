@@ -78,7 +78,8 @@ Create a new Wireguard interface:
   /container/start 0
   ```
 
-If port forwarding is not enabled, the container will exit after the Wiregaurd connection is configured.
+If port forwarding is not enabled, the container remains running after the Wireguard connection is configured.
+Transient failures while contacting PIA or RouterOS are retried indefinitely, with a delay between attempts.
 
 # Basic Configuration (Container running on another machine)
 
@@ -95,6 +96,39 @@ docker run -it --rm \
 -e PIAROS_ROS_PASSWORD="..." \
 -e PIAROS_ROS_INTERFACE="wg-pia" \
 ghcr.io/fruel/piaros:latest-amd64
+```
+
+# Publishing from a GitHub fork
+
+The existing [build workflow](.github/workflows/build.yml) builds `amd64`,
+`arm64`, and 32-bit `arm/v7` images. A version tag publishes the images to your
+fork's GitHub Container Registry namespace (`ghcr.io/OWNER/REPOSITORY`), creates
+a multi-platform `latest` image, and attaches architecture-specific tar files
+to a GitHub release. It uses GitHub's built-in `GITHUB_TOKEN`, so no registry
+credentials need to be added to your fork.
+
+In the fork's **Settings > Actions > General > Workflow permissions**, select
+**Read and write permissions**. Then push a version tag:
+
+   ```bash
+   git tag v1.0.1
+   git push origin v1.0.1
+   ```
+
+The workflow derives the image name from `github.repository`; it does not
+contain an owner-specific image path. After the workflow succeeds, consumers
+can let Docker select the correct architecture automatically:
+
+```bash
+docker pull ghcr.io/YOUR_GITHUB_USERNAME/piaros:latest
+```
+
+For RouterOS, download the architecture-specific image as a tar archive on a
+computer with Docker, and then upload that file to the router:
+
+```bash
+docker pull ghcr.io/YOUR_GITHUB_USERNAME/piaros:latest-arm64
+docker save ghcr.io/YOUR_GITHUB_USERNAME/piaros:latest-arm64 --output piaros-arm64.tar
 ```
 
 # Port Forwarding
@@ -194,3 +228,4 @@ All configuration options are passed via environment variables.
 | PIAROS_ROS_PORT_FORWARD_QBT_URL      | (optional) URL to a qBittorrent instance in which to change the listening port                                                                                             |
 | PIAROS_ROS_PORT_FORWARD_QBT_USER     | (optional) qBittorrent user                                                                                                                                                |
 | PIAROS_ROS_PORT_FORWARD_QBT_PASSWORD | (optional) qBittorrent password                                                                                                                                            |
+| PIAROS_RETRY_INTERVAL_SECONDS         | (optional) Delay in seconds before retrying after a PIA or RouterOS failure (default: `60`; must be greater than zero)                                                      |

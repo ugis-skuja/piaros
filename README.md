@@ -78,7 +78,8 @@ Create a new Wireguard interface:
   /container/start 0
   ```
 
-If port forwarding is not enabled, the container will exit after the Wiregaurd connection is configured.
+If port forwarding is not enabled, the container remains running after the Wireguard connection is configured.
+Transient failures while contacting PIA or RouterOS are retried indefinitely, with a delay between attempts.
 
 # Basic Configuration (Container running on another machine)
 
@@ -194,3 +195,4 @@ All configuration options are passed via environment variables.
 | PIAROS_ROS_PORT_FORWARD_QBT_URL      | (optional) URL to a qBittorrent instance in which to change the listening port                                                                                             |
 | PIAROS_ROS_PORT_FORWARD_QBT_USER     | (optional) qBittorrent user                                                                                                                                                |
 | PIAROS_ROS_PORT_FORWARD_QBT_PASSWORD | (optional) qBittorrent password                                                                                                                                            |
+| PIAROS_RETRY_INTERVAL_SECONDS         | (optional) Delay in seconds before retrying after a PIA or RouterOS failure (default: `60`; must be greater than zero)                                                      |

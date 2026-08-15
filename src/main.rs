@@ -1,11 +1,14 @@
 use env_logger::Env;
 use log::{error, info};
 use std::env;
+use std::time::Duration;
 
 mod pia;
 mod ros;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+const DEFAULT_RETRY_INTERVAL_SECONDS: u64 = 60;
 
 struct PortChangeNotifyConfig {
     webhook_url: Option<String>,
@@ -175,6 +178,16 @@ fn do_port_forwarding(
     }
 }
 
+fn retry_interval() -> Duration {
+    let seconds = env::var("PIAROS_RETRY_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_RETRY_INTERVAL_SECONDS);
+
+    Duration::from_secs(seconds)
+}
+
 fn run() -> Result<()> {
     let pia_user = env::var("PIAROS_PIA_USERNAME")?;
     let pia_password = env::var("PIAROS_PIA_PASSWORD")?;
@@ -205,8 +218,10 @@ fn run() -> Result<()> {
     configure_connection(&mut pia, &ros, &ros_interface, &ros_table)?;
 
     if !port_forward_enabled {
-        info!("Interface configuration complete. Exiting.");
-        return Ok(());
+        info!("Interface configuration complete. Waiting indefinitely.");
+        loop {
+            std::thread::park();
+        }
     }
 
     info!(
@@ -226,9 +241,15 @@ fn run() -> Result<()> {
 fn main() {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
-    let result = run();
-    if result.is_err() {
-        error!("Error: {}", result.unwrap_err());
-        std::process::exit(-1);
+    let retry_interval = retry_interval();
+    loop {
+        if let Err(error) = run() {
+            error!(
+                "Operation failed: {}. Retrying in {} seconds.",
+                error,
+                retry_interval.as_secs()
+            );
+            std::thread::sleep(retry_interval);
+        }
     }
 }
